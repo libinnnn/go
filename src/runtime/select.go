@@ -163,6 +163,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	// optimizing (and needing to test).
 
 	// generate permuted order
+	// 生成排列顺序
 	norder := 0
 	for i := range scases {
 		cas := &scases[i]
@@ -172,7 +173,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			cas.elem = nil // allow GC
 			continue
 		}
-
+		// 生成随机数
 		j := fastrandn(uint32(norder + 1))
 		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
@@ -183,6 +184,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 
 	// sort the cases by Hchan address to get the locking order.
 	// simple heap sort, to guarantee n log n time and constant stack footprint.
+	// lockorder堆排
 	for i := range lockorder {
 		j := i
 		// Start with the pollorder to permute cases on the same channel.
@@ -227,6 +229,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	}
 
 	// lock all the channels involved in the select
+	// 对地址相同的channel只会加锁一次
 	sellock(scases, lockorder)
 
 	var (
@@ -241,6 +244,7 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 	)
 
 	// pass 1 - look for something already waiting
+	// 查找是否有准备好的channel
 	var casi int
 	var cas *scase
 	var caseSuccess bool
@@ -253,12 +257,15 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 
 		if casi >= nsends {
 			sg = c.sendq.dequeue()
+			// 判断是否存在发送队列
 			if sg != nil {
 				goto recv
 			}
+			// 判断buf是否为空
 			if c.qcount > 0 {
 				goto bufrecv
 			}
+			// 判断是否关闭
 			if c.closed != 0 {
 				goto rclose
 			}
@@ -266,13 +273,16 @@ func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, blo
 			if raceenabled {
 				racereadpc(c.raceaddr(), casePC(casi), chansendpc)
 			}
+			// 判断是否关闭
 			if c.closed != 0 {
 				goto sclose
 			}
 			sg = c.recvq.dequeue()
+			// 判断接收队列是否为空
 			if sg != nil {
 				goto send
 			}
+			// 判断缓冲区是否已满
 			if c.qcount < c.dataqsiz {
 				goto bufsend
 			}
