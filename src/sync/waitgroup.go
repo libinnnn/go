@@ -25,6 +25,8 @@ type WaitGroup struct {
 	// compilers do not ensure it. So we allocate 12 bytes and then use
 	// the aligned 8 bytes in them as state, and the other 4 as storage
 	// for the sema.
+	// 一共用12个字节来表示
+	// 高32位代表计数为，低32位代表等待者的数目，中间32位为信号量
 	state1 [3]uint32
 }
 
@@ -51,6 +53,7 @@ func (wg *WaitGroup) state() (statep *uint64, semap *uint32) {
 // new Add calls must happen after all previous Wait calls have returned.
 // See the WaitGroup example.
 func (wg *WaitGroup) Add(delta int) {
+	// 取出数据和信号量
 	statep, semap := wg.state()
 	if race.Enabled {
 		_ = *statep // trigger nil deref early
@@ -61,8 +64,11 @@ func (wg *WaitGroup) Add(delta int) {
 		race.Disable()
 		defer race.Enable()
 	}
+	// 增减statep
 	state := atomic.AddUint64(statep, uint64(delta)<<32)
+	// 取出当前counter
 	v := int32(state >> 32)
+	// 获取当前正在等待的g
 	w := uint32(state)
 	if race.Enabled && delta > 0 && v == int32(delta) {
 		// The first increment must be synchronized with Wait.
@@ -73,9 +79,11 @@ func (wg *WaitGroup) Add(delta int) {
 	if v < 0 {
 		panic("sync: negative WaitGroup counter")
 	}
+	// w=0说明此时已经有g调用了wait方法在等待了，如果此时delta > 0 && v == int32(delta) 说明在调用了 Wait() 方法之后又想加入新的等待者，这种是不被允许的
 	if w != 0 && delta > 0 && v == int32(delta) {
 		panic("sync: WaitGroup misuse: Add called concurrently with Wait")
 	}
+	// 当前没有等待，直接返回就可以
 	if v > 0 || w == 0 {
 		return
 	}
@@ -89,6 +97,7 @@ func (wg *WaitGroup) Add(delta int) {
 	}
 	// Reset waiters count to 0.
 	*statep = 0
+	// 运行到这里说明等待着不为0，则释放所有的等待者
 	for ; w != 0; w-- {
 		runtime_Semrelease(semap, false, 0)
 	}
@@ -119,6 +128,7 @@ func (wg *WaitGroup) Wait() {
 			return
 		}
 		// Increment waiters count.
+		// 等待者数目+1
 		if atomic.CompareAndSwapUint64(statep, state, state+1) {
 			if race.Enabled && w == 0 {
 				// Wait must be synchronized with the first Add.
@@ -127,6 +137,7 @@ func (wg *WaitGroup) Wait() {
 				// otherwise concurrent Waits will race with each other.
 				race.Write(unsafe.Pointer(semap))
 			}
+			// 阻塞当前g，等待被唤醒
 			runtime_Semacquire(semap)
 			if *statep != 0 {
 				panic("sync: WaitGroup is reused before previous Wait has returned")

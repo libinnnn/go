@@ -26,11 +26,11 @@ import (
 // available; a blocked Lock call excludes new readers from acquiring the
 // lock.
 type RWMutex struct {
-	w           Mutex  // held if there are pending writers
-	writerSem   uint32 // semaphore for writers to wait for completing readers
-	readerSem   uint32 // semaphore for readers to wait for completing writers
-	readerCount int32  // number of pending readers
-	readerWait  int32  // number of departing readers
+	w           Mutex  // held if there are pending writers 复用互斥锁
+	writerSem   uint32 // semaphore for writers to wait for completing readers 信号量，用于写等待读
+	readerSem   uint32 // semaphore for readers to wait for completing writers 信号量，用于读等待写
+	readerCount int32  // number of pending readers 当前执行读的g的数量
+	readerWait  int32  // number of departing readers 写操作被阻塞的读的g的数量
 }
 
 const rwmutexMaxReaders = 1 << 30
@@ -58,8 +58,10 @@ func (rw *RWMutex) RLock() {
 		_ = rw.w.state
 		race.Disable()
 	}
+	// 返回负数，说明当前有写锁(因为加写锁的时候回把count减少为负数）
 	if atomic.AddInt32(&rw.readerCount, 1) < 0 {
 		// A writer is pending, wait for it.
+		// 休眠当前g等待被唤醒
 		runtime_SemacquireMutex(&rw.readerSem, false, 0)
 	}
 	if race.Enabled {
@@ -78,6 +80,7 @@ func (rw *RWMutex) RUnlock() {
 		race.ReleaseMerge(unsafe.Pointer(&rw.writerSem))
 		race.Disable()
 	}
+	// 将读者数目减1，如果小于0，则代表当前有写者
 	if r := atomic.AddInt32(&rw.readerCount, -1); r < 0 {
 		// Outlined slow-path to allow the fast-path to be inlined
 		rw.rUnlockSlow(r)
@@ -93,6 +96,7 @@ func (rw *RWMutex) rUnlockSlow(r int32) {
 		throw("sync: RUnlock of unlocked RWMutex")
 	}
 	// A writer is pending.
+	// 如果当前是最后一个读者的话，唤醒当前被阻塞的写者
 	if atomic.AddInt32(&rw.readerWait, -1) == 0 {
 		// The last reader unblocks the writer.
 		runtime_Semrelease(&rw.writerSem, false, 1)
@@ -108,10 +112,13 @@ func (rw *RWMutex) Lock() {
 		race.Disable()
 	}
 	// First, resolve competition with other writers.
+	// 写者之间互斥，因为需要加锁
 	rw.w.Lock()
 	// Announce to readers there is a pending writer.
+	// 读者减去一个大数，代表此时有写者正在工作
 	r := atomic.AddInt32(&rw.readerCount, -rwmutexMaxReaders) + rwmutexMaxReaders
 	// Wait for active readers.
+	// 如果当前有读者并且等待的读者数量不为0，则阻塞等待被唤醒
 	if r != 0 && atomic.AddInt32(&rw.readerWait, r) != 0 {
 		runtime_SemacquireMutex(&rw.writerSem, false, 0)
 	}
@@ -136,12 +143,14 @@ func (rw *RWMutex) Unlock() {
 	}
 
 	// Announce to readers there is no active writer.
+	// 将减去的读者数目归还带count上
 	r := atomic.AddInt32(&rw.readerCount, rwmutexMaxReaders)
 	if r >= rwmutexMaxReaders {
 		race.Enable()
 		throw("sync: Unlock of unlocked RWMutex")
 	}
 	// Unblock blocked readers, if any.
+	// 唤醒被阻塞的读者
 	for i := 0; i < int(r); i++ {
 		runtime_Semrelease(&rw.readerSem, false, 0)
 	}
