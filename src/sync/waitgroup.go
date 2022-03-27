@@ -97,7 +97,7 @@ func (wg *WaitGroup) Add(delta int) {
 	}
 	// Reset waiters count to 0.
 	*statep = 0
-	// 运行到这里说明等待着不为0，则释放所有的等待者
+	// 运行到这里说明等待者不为0，则释放所有的等待者
 	for ; w != 0; w-- {
 		runtime_Semrelease(semap, false, 0)
 	}

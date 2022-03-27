@@ -247,6 +247,7 @@ func (m *Mutex) Unlock() {
 }
 
 func (m *Mutex) unlockSlow(new int32) {
+	// 释放未上锁的锁，则会引发异常
 	if (new+mutexLocked)&mutexLocked == 0 {
 		throw("sync: unlock of unlocked mutex")
 	}
@@ -265,7 +266,7 @@ func (m *Mutex) unlockSlow(new int32) {
 				return
 			}
 			// Grab the right to wake someone.
-			// 锁的状态置为被唤醒并且等待队列-1
+			// 锁的状态置为被唤醒并且等待队列-1，通过信号量唤醒一个阻塞的g去获取锁
 			new = (old - 1<<mutexWaiterShift) | mutexWoken
 			if atomic.CompareAndSwapInt32(&m.state, old, new) {
 				runtime_Semrelease(&m.sema, false, 1)
