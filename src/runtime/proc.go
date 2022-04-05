@@ -2624,11 +2624,13 @@ top:
 	}
 
 	// local runq
+	// 再次查看本地队列
 	if gp, inheritTime := runqget(_p_); gp != nil {
 		return gp, inheritTime
 	}
 
 	// global runq
+	// 全局队列取出，这里需要进行上锁操作
 	if sched.runqsize != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(_p_, 0)
@@ -2645,6 +2647,7 @@ top:
 	// blocked thread (e.g. it has already returned from netpoll, but does
 	// not set lastpoll yet), this thread will do blocking netpoll below
 	// anyway.
+	// 从网路轮训器取出被阻塞的g，修改运行状态并且返回
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
 		if list := netpoll(0); !list.empty() { // non-blocking
 			gp := list.pop()
@@ -2663,21 +2666,26 @@ top:
 	// If number of spinning M's >= number of busy P's, block.
 	// This is necessary to prevent excessive CPU consumption
 	// when GOMAXPROCS>>1 but the program parallelism is low.
+	// 如果自旋的m大于繁忙的p的时候，进行阻塞，这有助于避免大量的cpu消耗
+	// 如果很多线程在工作，那么我就停下来休息
 	if !_g_.m.spinning && 2*atomic.Load(&sched.nmspinning) >= procs-atomic.Load(&sched.npidle) {
 		goto stop
 	}
+	// 设置自旋状态
 	if !_g_.m.spinning {
 		_g_.m.spinning = true
 		atomic.Xadd(&sched.nmspinning, 1)
 	}
+	// 尝试窃取次数为4
 	const stealTries = 4
 	for i := 0; i < stealTries; i++ {
 		stealTimersOrRunNextG := i == stealTries-1
-
+		// fastrand函数随机选取一个待窃取的g
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
 			if sched.gcwaiting != 0 {
 				goto top
 			}
+			// 获取待窃取的p
 			p2 := allp[enum.position()]
 			if _p_ == p2 {
 				continue
@@ -2720,6 +2728,7 @@ top:
 
 			// Don't bother to attempt to steal if p2 is idle.
 			if !idlepMask.read(enum.position()) {
+				// 从p2中偷取g
 				if gp := runqsteal(_p_, p2, stealTimersOrRunNextG); gp != nil {
 					return gp, false
 				}
@@ -2782,19 +2791,23 @@ stop:
 	timerpMaskSnapshot := timerpMask
 
 	// return P and block
+	// 上锁，保护好临界区
 	lock(&sched.lock)
 	if sched.gcwaiting != 0 || _p_.runSafePointFn != 0 {
 		unlock(&sched.lock)
 		goto top
 	}
+	// 如果这时候运行队列不为0，则从全局中返回一个g
 	if sched.runqsize != 0 {
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
 		return gp, false
 	}
+	// 将p和m解绑
 	if releasep() != _p_ {
 		throw("findrunnable: wrong p")
 	}
+	// 将p放入空闲队列
 	pidleput(_p_)
 	unlock(&sched.lock)
 
@@ -2820,6 +2833,7 @@ stop:
 	}
 
 	// check all runqueues once again
+	// 休眠之前再检查一下所有的p，有没有需要运行的
 	for id, _p_ := range allpSnapshot {
 		if !idlepMaskSnapshot.read(uint32(id)) && !runqempty(_p_) {
 			lock(&sched.lock)
@@ -3093,8 +3107,10 @@ func injectglist(glist *gList) {
 // One round of scheduler: find a runnable goroutine and execute it.
 // Never returns.
 func schedule() {
+	// 返回当前的g
 	_g_ := getg()
 
+	// 防御性编程，当前关联的M不应该被锁住
 	if _g_.m.locks != 0 {
 		throw("schedule: holding locks")
 	}
@@ -3106,6 +3122,7 @@ func schedule() {
 
 	// We should not schedule away from a g that is executing a cgo call,
 	// since the cgo call is using the m's g0 stack.
+	//
 	if _g_.m.incgo {
 		throw("schedule: in cgo")
 	}
@@ -3137,6 +3154,7 @@ top:
 	// Normal goroutines will check for need to wakeP in ready,
 	// but GCworkers and tracereaders will not, so the check must
 	// be done here instead.
+	// 普通的g会确认已经准备好的g，但是GCworkers和tracereaders不会，因此需要在前面先进行判断
 	tryWakeP := false
 	if trace.enabled || trace.shutdown {
 		gp = traceReader()
@@ -3146,14 +3164,19 @@ top:
 			tryWakeP = true
 		}
 	}
+	// gc操作，先不看
 	if gp == nil && gcBlackenEnabled != 0 {
+		// 获取一个可用的g
 		gp = gcController.findRunnableGCWorker(_g_.m.p.ptr())
 		tryWakeP = tryWakeP || gp != nil
 	}
+	// 如果g为空
 	if gp == nil {
 		// Check the global runnable queue once in a while to ensure fairness.
 		// Otherwise two goroutines can completely occupy the local runqueue
 		// by constantly respawning each other.
+		// 每隔一段时间检查一次全局可运行队列以确保公平,避免出现全局队列的g出现饥饿的情况
+		// 没调用shcedulehanshu61次就需要从全局队列当中获取
 		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
 			lock(&sched.lock)
 			gp = globrunqget(_g_.m.p.ptr(), 1)
@@ -3161,10 +3184,12 @@ top:
 		}
 	}
 	if gp == nil {
+		// 从LRQ中获取g
 		gp, inheritTime = runqget(_g_.m.p.ptr())
 		// We can see gp != nil here even if the M is spinning,
 		// if checkTimers added a local goroutine via goready.
 	}
+	// 如果本地队列获取不到，则从全局队列中去取
 	if gp == nil {
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
@@ -5898,13 +5923,17 @@ func runqputbatch(pp *p, q *gQueue, qsize int) {
 // If inheritTime is true, gp should inherit the remaining time in the
 // current time slice. Otherwise, it should start a new time slice.
 // Executed only by the owner P.
+// 如果inheritTime为真，则继承当前时间片，否则重新开启一个新的时间片
 func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	// If there's a runnext, it's the next G to run.
+	// 如果存在runnext，那么获取到直接返回，不用加锁，因为是本地队列
 	for {
 		next := _p_.runnext
+		// 没有的话则退出
 		if next == 0 {
 			break
 		}
+		// 再次判断next值有没有被修改，返回next指针以及是否继承时间片
 		if _p_.runnext.cas(next, 0) {
 			return next.ptr(), true
 		}
@@ -5913,9 +5942,11 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	for {
 		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
 		t := _p_.runqtail
+		// 如果头尾指针重合，则直接返回
 		if t == h {
 			return nil, false
 		}
+		// 不为空，则取出队列中的g，调整runhead的下标值，并返回
 		gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
 		if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
 			return gp, false
@@ -5933,9 +5964,11 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 		t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
 		n := t - h
 		n = n - n/2
+		// 如果待偷取的为空的化，就从runnext上面偷
 		if n == 0 {
 			if stealRunNextG {
 				// Try to steal from _p_.runnext.
+				// 从runnext中进行窃取，这里通过cas保证窃取互斥
 				if next := _p_.runnext; next != 0 {
 					if _p_.status == _Prunning {
 						// Sleep to ensure that _p_ isn't about to run the g
@@ -5966,13 +5999,16 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 			}
 			return 0
 		}
+		// 重新判断是否偷得太多，如果多了，则重新计算
 		if n > uint32(len(_p_.runq)/2) { // read inconsistent h and t
 			continue
 		}
+		// 正式开偷
 		for i := uint32(0); i < n; i++ {
 			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
 			batch[(batchHead+i)%uint32(len(batch))] = g
 		}
+		// 偷完了，修改对应的下标
 		if atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
 			return n
 		}
@@ -5997,6 +6033,7 @@ func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
 	if t-h+n >= uint32(len(_p_.runq)) {
 		throw("runqsteal: runq overflow")
 	}
+	// 修改尾部指针，正式宣布偷取完成
 	atomic.StoreRel(&_p_.runqtail, t+n) // store-release, makes the item available for consumption
 	return gp
 }

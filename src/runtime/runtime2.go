@@ -415,7 +415,7 @@ type g struct {
 
 	_panic       *_panic // innermost panic - offset known to liblink
 	_defer       *_defer // innermost defer
-	m            *m      // current m; offset known to arm liblink
+	m            *m      // current m; offset known to arm liblink 当前关联的线程
 	sched        gobuf
 	syscallsp    uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
 	syscallpc    uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
