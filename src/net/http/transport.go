@@ -94,8 +94,8 @@ const DefaultMaxIdleConnsPerHost = 2
 type Transport struct {
 	idleMu       sync.Mutex
 	closeIdle    bool                                // user has requested to close all idle conns
-	idleConn     map[connectMethodKey][]*persistConn // most recently used at end
-	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
+	idleConn     map[connectMethodKey][]*persistConn // most recently used at end 全局连接缓存
+	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns 等待队列，用于连接分配
 	idleLRU      connLRU
 
 	reqMu       sync.Mutex
@@ -576,7 +576,7 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 		// host (for http or https), the http proxy, or the http proxy
 		// pre-CONNECTed to https server. In any case, we'll be ready
 		// to send it requests.
-		pconn, err := t.getConn(treq, cm)
+		pconn, err := t.getConn(treq, cm) // 获取连接
 		if err != nil {
 			t.setReqCanceler(cancelKey, nil)
 			req.closeBody()
@@ -925,13 +925,16 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	// Chrome calls this socket late binding.
 	// See https://www.chromium.org/developers/design-documents/network-stack#TOC-Connection-Management.)
 	key := pconn.cacheKey
+	// 队列中有等待当前key的请求
 	if q, ok := t.idleConnWait[key]; ok {
 		done := false
 		if pconn.alt == nil {
 			// HTTP/1.
 			// Loop over the waiting list until we find a w that isn't done already, and hand it pconn.
 			for q.len() > 0 {
+				// 从缓存队列中出队
 				w := q.popFront()
+				// 直到分配到一个可用的连接为止
 				if w.tryDeliver(pconn, nil) {
 					done = true
 					break
@@ -943,15 +946,18 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 			// and we still won't be done: we want to put it in the idle
 			// list unconditionally, for any future clients too.
 			for q.len() > 0 {
+				// 出队，领取连接
 				w := q.popFront()
 				w.tryDeliver(pconn, nil)
 			}
 		}
+		// 如果分配完之后队列为空，则从缓存中移除
 		if q.len() == 0 {
 			delete(t.idleConnWait, key)
-		} else {
+		} else { // 不为空则代表当前队列中还有需要获取请求的连接，则更新
 			t.idleConnWait[key] = q
 		}
+		// 如果有分配到就直接返回
 		if done {
 			return nil
 		}
@@ -964,6 +970,7 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 		t.idleConn = make(map[connectMethodKey][]*persistConn)
 	}
 	idles := t.idleConn[key]
+	// 防御性校验，理论上这么不会出现问题，除非此时设置的最大值发生了变化
 	if len(idles) >= t.maxIdleConnsPerHost() {
 		return errTooManyIdleHost
 	}
@@ -972,7 +979,9 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 			log.Fatalf("dup idle pconn %p in freelist", pconn)
 		}
 	}
+	// 没有等待队列需要分配的，当前的连接加入全局可用连接中，等到被分配
 	t.idleConn[key] = append(idles, pconn)
+	// 加入LRU（最近最少使用淘汰）队列中，通过这个队列控制最大连接数
 	t.idleLRU.add(pconn)
 	if t.MaxIdleConns != 0 && t.idleLRU.len() > t.MaxIdleConns {
 		oldest := t.idleLRU.removeOldest()
@@ -998,6 +1007,7 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 // As an optimization hint to the caller, queueForIdleConn reports whether
 // it successfully delivered an already-idle connection.
 func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
+	// 仅在keepalive为真的情况下生效
 	if t.DisableKeepAlives {
 		return false
 	}
@@ -1067,6 +1077,7 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 		} else {
 			delete(t.idleConn, w.key)
 		}
+		// 如果分配成功后，直接返回
 		if stop {
 			return delivered
 		}
@@ -1076,7 +1087,9 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 	if t.idleConnWait == nil {
 		t.idleConnWait = make(map[connectMethodKey]wantConnQueue)
 	}
+	// 未从队列中取到，将当前的连接加入到请求队列中
 	q := t.idleConnWait[w.key]
+	// 清理队里中不存在waiting状态的请求
 	q.cleanFront()
 	q.pushBack(w)
 	t.idleConnWait[w.key] = q
@@ -1189,15 +1202,15 @@ type wantConn struct {
 	beforeDial func()
 	afterDial  func()
 
-	mu  sync.Mutex // protects pc, err, close(ready)
-	pc  *persistConn
+	mu  sync.Mutex   // protects pc, err, close(ready)
+	pc  *persistConn // 长连接
 	err error
 }
 
 // waiting reports whether w is still waiting for an answer (connection or error).
 func (w *wantConn) waiting() bool {
 	select {
-	case <-w.ready:
+	case <-w.ready: // 如果不在接受即close(ready)之后能收到相应的信号
 		return false
 	default:
 		return true
@@ -1218,7 +1231,7 @@ func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
 	if w.pc == nil && w.err == nil {
 		panic("net/http: internal error: misuse of tryDeliver")
 	}
-	close(w.ready)
+	close(w.ready) // 通知阻塞的协程，当前已经完成通知
 	return true
 }
 
@@ -1300,6 +1313,7 @@ func (q *wantConnQueue) cleanFront() (cleaned bool) {
 		if w == nil || w.waiting() {
 			return cleaned
 		}
+		// 当前这个队列中的请求不属于waiting状态，则将他移除
 		q.popFront()
 		cleaned = true
 	}
@@ -1344,6 +1358,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 	}()
 
 	// Queue for idle connection.
+	// http连接池
 	if delivered := t.queueForIdleConn(w); delivered {
 		pc := w.pc
 		// Trace only for HTTP/1.
@@ -1362,11 +1377,12 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 	t.setReqCanceler(treq.cancelKey, func(err error) { cancelc <- err })
 
 	// Queue for permission to dial.
+	// 未从连接池中取到连接，创建短连接
 	t.queueForDial(w)
 
 	// Wait for completion or cancellation.
 	select {
-	case <-w.ready:
+	case <-w.ready: // 当创建短连接成功后，会close(w.ready)来进行信号通知，否则阻塞在这个地方
 		// Trace success but only for HTTP/1.
 		// HTTP/2 calls trace.GotConn itself.
 		if w.pc != nil && w.pc.alt == nil && trace != nil && trace.GotConn != nil {
@@ -1407,6 +1423,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 // Once w receives permission to dial, it will do so in a separate goroutine.
 func (t *Transport) queueForDial(w *wantConn) {
 	w.beforeDial()
+	// 当host最大连接数小于等于0，则重新创建新连接
 	if t.MaxConnsPerHost <= 0 {
 		go t.dialConnFor(w)
 		return
@@ -1438,7 +1455,7 @@ func (t *Transport) queueForDial(w *wantConn) {
 // If the dial is cancelled or unsuccessful, dialConnFor decrements t.connCount[w.cm.key()].
 func (t *Transport) dialConnFor(w *wantConn) {
 	defer w.afterDial()
-
+	// 请求创建连接，由于是短连接，不会放到连接池中
 	pc, err := t.dialConn(w.ctx, w.cm)
 	delivered := w.tryDeliver(pc, err)
 	if err == nil && (!delivered || pc.alt != nil) {
@@ -2128,7 +2145,7 @@ func (pc *persistConn) readLoop() {
 			// StatusCode 100 is already handled above.
 			alive = false
 		}
-
+		// 请求读取完毕
 		if !hasBody || bodyWritable {
 			replaced := pc.t.replaceReqCanceler(rc.cancelKey, nil)
 
@@ -2140,7 +2157,7 @@ func (pc *persistConn) readLoop() {
 			alive = alive &&
 				!pc.sawEOF &&
 				pc.wroteRequest() &&
-				replaced && tryPutIdleConn(trace)
+				replaced && tryPutIdleConn(trace) //  将当前的连接放回到连接池中
 
 			if bodyWritable {
 				closeErr = errCallerOwnsConn
@@ -2624,7 +2641,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 				defer timer.Stop() // prevent leaks
 				respHeaderTimer = timer.C
 			}
-		case <-pcClosed:
+		case <-pcClosed: // 连接被正常关闭了
 			pcClosed = nil
 			if canceled || pc.t.replaceReqCanceler(req.cancelKey, nil) {
 				if debugRoundTrip {

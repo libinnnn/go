@@ -554,11 +554,15 @@ func urlErrorOp(method string) string {
 // error.
 //
 // If the returned error is nil, the Response will contain a non-nil
+// 如果返回的错误为 nil，则 Response 将包含一个非 nil
 // Body which the user is expected to close. If the Body is not both
+// 期望用户关闭的正文。如果返回体不是两者
 // read to EOF and closed, the Client's underlying RoundTripper
+// 读取 EOF 并关闭，客户端的底层 RoundTripper
 // (typically Transport) may not be able to re-use a persistent TCP
+//（通常是传输）可能无法重用持久 TCP
 // connection to the server for a subsequent "keep-alive" request.
-//
+// 连接到服务器以进行后续的“keep-alive”请求。
 // The request Body, if non-nil, will be closed by the underlying
 // Transport, even on errors.
 //
@@ -729,7 +733,7 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 
 		var shouldRedirect bool
 		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
-		if !shouldRedirect {
+		if !shouldRedirect { // 如果需要进行重定向，就会进入到if len(reqs) > 0的逻辑；否则直接返回
 			return resp, nil
 		}
 
